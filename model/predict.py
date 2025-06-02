@@ -4,52 +4,87 @@ import sys
 import json
 import joblib
 import numpy as np
-import random
 import time
+import serial
+import pandas as pd
+import subprocess
+subprocess.run(["stty", "-F", "/dev/ttyUSB0", "-hupcl"])
 
-# -------------------------------------------------------
-# 1) Determine the path to this script�s directory,
-#    then build the absolute path to your .pkl file.
-# -------------------------------------------------------
+# --------------------------------------------
+# 1) Load the LightGBM model
+# --------------------------------------------
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_NAME = 'lgbm_model.pkl'  # <-- Update if your file is named differently
-MODEL_PATH = os.path.join(THIS_DIR, MODEL_NAME)
+MODEL_PATH = os.path.join(THIS_DIR, 'lgbm_model.pkl')
 
-# -------------------------------------------------------
-# 2) Load the model once
-# -------------------------------------------------------
 try:
     model = joblib.load(MODEL_PATH)
 except Exception as e:
-    sys.stderr.write(f"ERROR loading model at {MODEL_PATH}: {e}\n")
+    sys.stderr.write(f"ERROR loading model: {e}\n")
     sys.exit(1)
 
-# -------------------------------------------------------
-# 3) Generate random sensor data
-# -------------------------------------------------------
-sensor_data = {
-    "pH_H2O": round(random.uniform(5.5, 8.5), 2),  # realistic pH range
-    "EC":     round(random.uniform(10, 50), 2),    # electrical conductivity
-    "P":      round(random.uniform(5, 30), 2),     # phosphorus
-    "N":      round(random.uniform(0.5, 5), 2),    # nitrogen
-    "K":      round(random.uniform(20, 100), 2),   # potassium
-    "Elev":   round(random.uniform(0, 500), 2)     # elevation
-}
+# --------------------------------------------
+# 2) Open serial port to Arduino
+# --------------------------------------------
+try:
+    ser = serial.Serial('/dev/ttyUSB0', 9600, timeout=2)
+    time.sleep(2)
+except Exception as e:
+    sys.stderr.write(f"ERROR opening serial port: {e}\n")
+    sys.exit(1)
 
-# -------------------------------------------------------
-# 4) Prepare feature matrix in the same column order you trained on
-# -------------------------------------------------------
-features = ["pH_H2O", "EC", "P", "N", "K", "Elev"]
-X = np.array([[sensor_data[k] for k in features]])
+# --------------------------------------------
+# 3) Parse CSV input 
+# --------------------------------------------
+def parse_csv_line(line):
+    try:
+        values = list(map(float, line.strip().split(',')))
+        if len(values) != 6:
+            raise ValueError(f"Expected 6 values, got {len(values)}")
+        raw_keys = ["pH", "EC", "N", "P", "K", "Elev"]
+        raw_data = dict(zip(raw_keys, values))
 
-# -------------------------------------------------------
-# 5) Predict (in log space), invert the log transform
-# -------------------------------------------------------
-y_log = model.predict(X)
-prediction = float(np.expm1(y_log))
+        # Remap for model input
+        sensor_data = {
+            "pH_H2O": raw_data["pH"],  # for model
+            "EC":     raw_data["EC"],
+            "P":      raw_data["P"],
+            "N":      raw_data["N"],
+            "K":      raw_data["K"],
+            "Elev":   raw_data["Elev"]
+        }
+        return sensor_data
+    except Exception as e:
+        sys.stderr.write(f"ERROR parsing line: {line} -- {e}\n")
+        return None
 
-# -------------------------------------------------------
-# 6) Merge and output JSON
-# -------------------------------------------------------
-sensor_data["carbonContent"] = prediction
+sensor_data = None
+for _ in range(10):
+    try:
+        line = ser.readline().decode('utf-8').strip()
+        if line:
+            sensor_data = parse_csv_line(line)
+            if sensor_data:
+                break
+    except Exception as e:
+        sys.stderr.write(f"Serial read error: {e}\n")
+
+ser.close()
+
+if not sensor_data:
+    sys.stderr.write("Failed to read valid sensor data from Arduino.\n")
+    sys.exit(1)
+
+# --------------------------------------------
+# 4) Predict OC and output
+# --------------------------------------------
+feature_keys = ["pH_H2O", "EC", "P", "N", "K", "Elev"]
+try:
+    df = pd.DataFrame([sensor_data], columns=feature_keys)
+    y_log = model.predict(df)
+    prediction = float(np.expm1(y_log[0]))
+    sensor_data["carbonContent"] = prediction
+except Exception as e:
+    sys.stderr.write(f"Prediction failed: {e}\n")
+    sys.exit(1)
+
 print(json.dumps(sensor_data))
